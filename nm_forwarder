@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+# nm_forwarder by Sacha Ligthert <s.ligthert@newmotion.com>
+# 2018-03-19 in Amsterdam
+# Version: v2018121201
+
+# Import generic stuff
+import requests
+import json
+import os
+import sys
+import time
+import datetime
+import re
+
+# Import Flask
+from flask import Flask
+from flask import request
+from flask import redirect
+from flask import Response
+# from flask import render_template
+# from flask import render_template_string
+
+# Load the main body
+app = Flask(__name__)
+
+# Global variables
+app_json = {}
+metrics = {}
+
+# Default route: EVERYTHING (https://i.gifer.com/1HOo.gif)
+@app.route("/",defaults={'path':''})
+@app.route("/<path:path>")
+def page_default(path):
+
+  rdr_accepted = ["301","302","frame"]
+
+  if app.debug:
+    print_debug("Parsing "+request.url)
+
+  # Let New Motion monitoring know everything is a-ok
+  if request.url == app_json['url_status']:
+    if app.debug:
+      print_debug("Status URL matched")
+    return "OK"
+
+  # Push some metrics for prometheus to read
+  if request.url == app_json['url_prometheus']:
+    if app.debug:
+      print_debug("Prometheus URL matched ("+app_json['url_prometheus']+"), printing metrics.")
+    #return redirect(app_json['url_prometheus']) # <== TODO: Create an exporter (Soon)
+    print(metrics_print())
+    return metrics_print()
+
+  # Parse the redirect-configs, match it, redirect if needed.
+  for redirect_info in app_json['redirects']:
+    found = 0
+    rdr_from = redirect_info['from']
+    rdr_to = redirect_info['to']
+    try:
+      if redirect_info['type'] in rdr_accepted:
+        rdr_type = redirect_info['type']
+      else:
+        rdr_type = "302"
+    except KeyError:
+      rdr_type = "302"
+
+    if app.debug:
+      print_debug("Validating From: "+rdr_from+"; To: "+rdr_to+"; Type: "+rdr_type+";")
+
+    # Match the given URL with what is searched for
+    myMatch = re.search(rdr_from,request.url)
+    try:
+      found = len(myMatch.groups())
+      if app.debug:
+        print_debug("Match(es) found: "+str(found))
+    except:
+      found = 0
+      if app.debug:
+        print_debug("No match found")
+
+    # Only do something with it if a match has been found or the URL is exactly what is searched for.
+    if found != 0 or request.url == rdr_from:
+      # Do search and replace actions from the requested URL into what it should be.
+      counter = 1
+      for myGroup in myMatch.groups():
+        rdr_to = rdr_to.replace("["+str(counter)+"]",myGroup)
+        if app.debug:
+          print_debug("Morphed rdr_to into: "+rdr_to)
+        counter = counter + 1
+      # Print an iframe of the type is "frame" or else just redirect.
+      if rdr_type == "frame":
+        if app.debug:
+          print_debug("Type: frame; Printing frame: "+rdr_to)
+        metrics_update(request.url, rdr_to, rdr_type)
+        return "<iframe src=\""+rdr_to+"\" style=\"border:none;height:100%;width:100%;\"></iframe>"
+      else:
+        if app.debug:
+          print_debug("Redirecting to URL: "+rdr_to)
+        metrics_update(request.url,rdr_to,rdr_type)
+        return redirect(rdr_to,code=rdr_type)
+
+  # If no matches were found, redirect to the default redirect
+  if app.debug:
+    print_debug("No matches found, redirecting to default URL ("+app_json['url_default']+")")
+  metrics_update(request.url,app_json['url_default'],302)
+  return redirect(app_json['url_default'])
+
+# Have a template for printing debug messages.
+def print_debug(msg):
+  print("DEBUG: "+str(msg))
+
+## Functions related to metrics
+def metrics_update(rdr_from, rdr_to, rdr_type):
+  varname = str(rdr_from)+";;;"+str(rdr_to)+";;;"+str(rdr_type)
+  try:
+    metrics[varname] = metrics[varname] + 1
+  except:
+    metrics[varname] = 1
+
+def metrics_print():
+  keys = metrics.keys()
+  retval = "# HELP nm_forwarder_redirect print metrics about redirects\n# TYPE nm_forwarder_redirect gauge\n"
+  for key in keys:
+    split = key.split(";;;")
+    retval = retval + "nm_forwarder_redirect{from=\""+str(split[0])+"\",to=\""+str(split[1])+"\",type=\""+str(split[2])+"\"} "+str(metrics[key])+"\n"
+  return(retval)
+
+# Main program loop
+if __name__ == "__main__":
+
+  # Ensure we have a config
+  try:
+    app_config = os.environ["NM_FORWARDER_CONFIG"]
+  except KeyError:
+    print("NM_FORWARDER_CONFIG not set. Quitting")
+    sys.exit(1)
+
+  # Ensure what we got is JSON, or else it will bug out if its faulty
+  try:
+    app_json = json.loads(app_config)
+  except json.decoder.JSONDecodeError:
+    print("Invalid JSON in NMSTATUS_EXPORTER_CONFIG")
+    sys.exit(1)
+
+  # Set debug to whatever the user sets it, default to False otherwise.
+  try:
+    debug = app_json['debug']
+    if debug.lower() != "true":
+      del debug
+    print_debug("Debug set to: "+debug)
+  except:
+    debug = False
+
+  # Run the application that does the heavy lifting
+  app.run(debug=debug,host='0.0.0.0',port=int(app_json['port']))
